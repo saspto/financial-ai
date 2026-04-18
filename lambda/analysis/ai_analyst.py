@@ -12,10 +12,10 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-# Claude Haiku 3 on Bedrock — cost ~$0.25/M input, $1.25/M output
+# Claude Haiku 3.5 on Bedrock — cost ~$0.80/M input, $4/M output
 # Haiku strikes best cost/quality balance for structured financial summaries
-MODEL_ID = "anthropic.claude-haiku-3-5-sonnet-20241022-v2:0"
-BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
+MODEL_ID = "anthropic.claude-3-5-haiku-20241022-v1:0"
+BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-west-2")
 
 SYSTEM_PROMPT = """You are a senior financial analyst with 20+ years of experience at top Wall Street firms.
 You write concise, data-driven financial intelligence reports for institutional investors.

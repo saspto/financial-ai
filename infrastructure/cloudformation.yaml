@@ -10,7 +10,7 @@ Parameters:
     Description: Comma-separated list of recipient email addresses
   BedrockRegion:
     Type: String
-    Default: us-east-1
+    Default: us-west-2
     Description: AWS region for Bedrock (must support Claude Haiku)
   LambdaMemoryMB:
     Type: Number
@@ -122,7 +122,7 @@ Resources:
                 Action:
                   - bedrock:InvokeModel
                 Resource:
-                  - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/anthropic.claude-haiku-3-5-sonnet-20241022-v2:0"
+                  - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0"
               - Sid: SESEmail
                 Effect: Allow
                 Action:
