@@ -1,0 +1,37 @@
+# Financial AI Report Configuration
+# Copy this to config.yaml and fill in your values.
+# All secrets should go into SSM Parameter Store (see scripts/setup_ssm.sh).
+
+aws:
+  region: us-east-1
+  bedrock_region: us-east-1
+  s3_bucket: financial-ai-reports-<YOUR_ACCOUNT_ID>
+
+email:
+  sender: reports@yourdomain.com       # Must be SES-verified
+  recipients:
+    - analyst@yourdomain.com
+    - team@yourdomain.com
+
+report:
+  prefix: reports                      # S3 key prefix
+  top_n_stocks: 50
+  top_n_etfs: 50
+  schedule_time: "06:30"               # 6:30 AM ET Mon-Fri
+
+# API Keys (store in SSM, not here)
+# SSM paths:
+#   /financial-ai/newsapi-key    — https://newsapi.org (free tier: 100 req/day)
+#   /financial-ai/finnhub-key    — https://finnhub.io  (free tier: 60 req/min)
+#
+# yfinance is free, no key needed.
+# AWS Bedrock Claude Haiku 3.5 — billed per token (~$0.10/report)
+
+api_keys:
+  newsapi_ssm_param: /financial-ai/newsapi-key
+  finnhub_ssm_param: /financial-ai/finnhub-key
+
+lambda:
+  memory_mb: 1792    # 1.75 GB RAM = ~1 vCPU equivalent
+  timeout_sec: 540   # 9 minutes
+  runtime: python3.12

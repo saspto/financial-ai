@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Financial AI Daily Report System — FedRAMP-compliant, cost-optimized
+
+Parameters:
+  SESEmailSender:
+    Type: String
+    Description: Verified SES sender email address
+  SESEmailRecipients:
+    Type: String
+    Description: Comma-separated list of recipient email addresses
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region for Bedrock (must support Claude Haiku)
+  LambdaMemoryMB:
+    Type: Number
+    Default: 1792
+    Description: Lambda memory in MB (higher = more CPU = faster yfinance downloads)
+  LambdaTimeoutSec:
+    Type: Number
+    Default: 540
+    Description: Lambda timeout (max 900s)
+  EnableKMSEncryption:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  UseKMS: !Equals [!Ref EnableKMSEncryption, "true"]
+
+Resources:
+
+  # ─── KMS Key for S3 encryption (FedRAMP) ─────────────────────────────────────
+  ReportKMSKey:
+    Type: AWS::KMS::Key
+    Condition: UseKMS
+    Properties:
+      Description: Financial AI report encryption key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  ReportKMSAlias:
+    Type: AWS::KMS::Alias
+    Condition: UseKMS
+    Properties:
+      AliasName: alias/financial-ai-reports
+      TargetKeyId: !Ref ReportKMSKey
+
+  # ─── S3 Bucket for PDF reports ────────────────────────────────────────────────
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "financial-ai-reports-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseKMS, "aws:kms", "AES256"]
+              KMSMasterKeyID: !If [UseKMS, !Ref ReportKMSKey, !Ref AWS::NoValue]
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldReports
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            ExpirationInDays: 730
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: financial-ai
+
+  # ─── CloudWatch Log Group ────────────────────────────────────────────────────
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/financial-ai-report
+      RetentionInDays: 30
+
+  # ─── IAM Role for Lambda ──────────────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: financial-ai-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: financial-ai-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3Reports
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ReportsBucket.Arn
+                  - !Sub "${ReportsBucket.Arn}/*"
+              - Sid: BedrockInvoke
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/anthropic.claude-haiku-3-5-sonnet-20241022-v2:0"
+              - Sid: SESEmail
+                Effect: Allow
+                Action:
+                  - ses:SendRawEmail
+                  - ses:SendEmail
+                Resource: "*"
+              - Sid: SSMSecrets
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/financial-ai/*"
+              - Sid: KMSDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !If [UseKMS, !GetAtt ReportKMSKey.Arn, !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"]
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LambdaLogGroup.Arn
+
+  # ─── Lambda Function ──────────────────────────────────────────────────────────
+  ReportLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: financial-ai-report
+      Description: Daily financial intelligence report generator
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemoryMB
+      Timeout: !Ref LambdaTimeoutSec
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref ReportsBucket
+          SES_SENDER: !Ref SESEmailSender
+          SES_RECIPIENTS: !Ref SESEmailRecipients
+          BEDROCK_REGION: !Ref BedrockRegion
+          REPORT_PREFIX: reports
+      Code:
+        S3Bucket: !Sub "financial-ai-deploy-${AWS::AccountId}"
+        S3Key: lambda.zip
+      Layers:
+        - !Ref DependenciesLayer
+      Tags:
+        - Key: Project
+          Value: financial-ai
+
+  DependenciesLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: financial-ai-deps
+      Description: Python dependencies for financial-ai report
+      Content:
+        S3Bucket: !Sub "financial-ai-deploy-${AWS::AccountId}"
+        S3Key: layer.zip
+      CompatibleRuntimes:
+        - python3.12
+
+  # ─── EventBridge Scheduler (Mon–Fri 6:30 AM ET) ──────────────────────────────
+  # Mon–Fri schedule; Monday covers Fri+weekend data automatically in handler.py
+  ReportScheduler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: financial-ai-daily
+      Description: Daily financial report Mon-Fri at 6:30 AM ET
+      ScheduleExpression: "cron(30 11 ? * MON-FRI *)"  # 11:30 UTC = 6:30 AM ET (EST)
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow:
+        Mode: FLEXIBLE
+        MaximumWindowInMinutes: 10
+      Target:
+        Arn: !GetAtt ReportLambda.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+      State: ENABLED
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: financial-ai-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-lambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ReportLambda.Arn
+
+  # ─── CloudWatch Alarms ────────────────────────────────────────────────────────
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: financial-ai-lambda-errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReportLambda
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt ReportLambda.Arn
+    Description: Lambda function ARN
+  S3BucketName:
+    Value: !Ref ReportsBucket
+    Description: S3 bucket for PDF reports
+  SchedulerName:
+    Value: !Ref ReportScheduler
+    Description: EventBridge Scheduler name
