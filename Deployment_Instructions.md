@@ -323,3 +323,196 @@ aws scheduler update-schedule \
   --target '{"Arn":"arn:aws:lambda:us-west-2:064357173439:function:financial-ai-report","RoleArn":"..."}' \
   --region us-west-2
 ```
+
+---
+
+## Optional: Switch to Google Gemini instead of AWS Bedrock
+
+By default the system uses **AWS Bedrock Claude Haiku 3.5**. You can switch to **Google Gemini** at any time — no code changes needed, only configuration.
+
+### What changes
+
+| Layer | Default (Bedrock) | Gemini alternative |
+|-------|-------------------|-------------------|
+| `LLM_PROVIDER` env var | `bedrock` | `gemini` |
+| Auth | AWS IAM (automatic) | Gemini API key in SSM |
+| Model | `anthropic.claude-3-5-haiku-20241022-v1:0` | `gemini-2.0-flash` (recommended) |
+| Cost per report | ~$0.10 | ~$0.05–0.08 (Flash) |
+| AWS Bedrock access needed | Yes | No |
+
+### Supported Gemini models
+
+| Model | Quality | Speed | Cost (input/output per 1M tokens) |
+|-------|---------|-------|-----------------------------------|
+| `gemini-2.0-flash` | Good | Fastest | $0.10 / $0.40 |
+| `gemini-2.0-flash-thinking` | Better | Fast | $0.10 / $3.50 |
+| `gemini-1.5-pro` | Best | Slower | $1.25 / $5.00 |
+| `gemini-1.5-flash` | Good | Fast | $0.075 / $0.30 |
+
+**Recommended**: `gemini-2.0-flash` — cheapest, fastest, sufficient for structured JSON financial summaries.
+
+### Step 1: Get a Gemini API key
+
+1. Go to **https://aistudio.google.com/apikey**
+2. Click **Create API key**
+3. Copy the key (starts with `AIza...`)
+
+> Free tier: 15 req/min, 1,500 req/day — more than enough for one daily report.
+> Paid tier activates automatically if you exceed free limits.
+
+### Step 2: Store the API key in SSM
+
+```bash
+REGION="us-west-2"
+
+aws ssm put-parameter \
+  --name "/financial-ai/gemini-key" \
+  --value "AIzaSy..." \
+  --type SecureString \
+  --overwrite \
+  --region "$REGION"
+```
+
+Verify it was stored:
+```bash
+aws ssm get-parameter \
+  --name "/financial-ai/gemini-key" \
+  --with-decryption \
+  --region "$REGION" \
+  --query "Parameter.Value" \
+  --output text
+```
+
+### Step 3: Re-deploy with Gemini enabled
+
+**Option A — CloudFormation parameter** (recommended, keeps infra-as-code):
+
+```bash
+REGION="us-west-2"
+
+aws cloudformation deploy \
+  --template-file infrastructure/cloudformation.yaml \
+  --stack-name financial-ai \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region "$REGION" \
+  --parameter-overrides \
+    SESEmailSender="sas3d@yahoo.com" \
+    SESEmailRecipients="sas3d@yahoo.com" \
+    LLMProvider="gemini" \
+    GeminiModelId="gemini-2.0-flash" \
+  --no-fail-on-empty-changeset
+```
+
+**Option B — Update Lambda env var directly** (faster, no CFN update cycle):
+
+```bash
+REGION="us-west-2"
+
+aws lambda update-function-configuration \
+  --function-name financial-ai-report \
+  --region "$REGION" \
+  --environment "Variables={
+    S3_BUCKET=financial-ai-reports-064357173439,
+    SES_SENDER=sas3d@yahoo.com,
+    SES_RECIPIENTS=sas3d@yahoo.com,
+    BEDROCK_REGION=us-west-2,
+    REPORT_PREFIX=reports,
+    LLM_PROVIDER=gemini,
+    GEMINI_MODEL_ID=gemini-2.0-flash,
+    GEMINI_KEY_SSM_PARAM=/financial-ai/gemini-key
+  }"
+```
+
+### Step 4: Add `google-generativeai` to the Lambda layer
+
+The Gemini SDK must be included in the Lambda layer. Rebuild and re-upload:
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REGION="us-west-2"
+DEPLOY_BUCKET="financial-ai-deploy-${ACCOUNT_ID}"
+
+# Rebuild layer with Gemini SDK added
+rm -rf /tmp/lambda-layer
+mkdir -p /tmp/lambda-layer/python
+pip install \
+  yfinance pandas numpy requests beautifulsoup4 lxml \
+  boto3 reportlab Pillow feedparser python-dateutil pytz \
+  finnhub-python google-generativeai \
+  --target /tmp/lambda-layer/python --quiet
+
+cd /tmp/lambda-layer
+zip -r /tmp/layer.zip python/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
+echo "Layer size: $(du -sh /tmp/layer.zip | cut -f1)"
+
+# Upload and publish new layer version
+aws s3 cp /tmp/layer.zip "s3://$DEPLOY_BUCKET/layer.zip" --region "$REGION"
+
+LAYER_ARN=$(aws lambda publish-layer-version \
+  --layer-name financial-ai-deps \
+  --content "S3Bucket=$DEPLOY_BUCKET,S3Key=layer.zip" \
+  --compatible-runtimes python3.12 \
+  --region "$REGION" \
+  --query "LayerVersionArn" \
+  --output text)
+
+echo "New layer ARN: $LAYER_ARN"
+
+# Attach the new layer version to the function
+aws lambda update-function-configuration \
+  --function-name financial-ai-report \
+  --layers "$LAYER_ARN" \
+  --region "$REGION"
+```
+
+### Step 5: Test the Gemini-powered report
+
+```bash
+aws lambda invoke \
+  --function-name financial-ai-report \
+  --region us-west-2 \
+  --payload '{"test": true}' \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/test-output.json && cat /tmp/test-output.json
+```
+
+Watch logs to confirm the right provider was used:
+```bash
+aws logs tail /aws/lambda/financial-ai-report \
+  --region us-west-2 \
+  --follow \
+  --filter-pattern "LLM provider"
+# Should print: LLM provider: Gemini (gemini-2.0-flash)
+```
+
+### Switching back to Bedrock
+
+```bash
+aws lambda update-function-configuration \
+  --function-name financial-ai-report \
+  --region us-west-2 \
+  --environment "Variables={
+    S3_BUCKET=financial-ai-reports-064357173439,
+    SES_SENDER=sas3d@yahoo.com,
+    SES_RECIPIENTS=sas3d@yahoo.com,
+    BEDROCK_REGION=us-west-2,
+    REPORT_PREFIX=reports,
+    LLM_PROVIDER=bedrock,
+    GEMINI_MODEL_ID=gemini-2.0-flash,
+    GEMINI_KEY_SSM_PARAM=/financial-ai/gemini-key
+  }"
+```
+
+### Gemini IAM note
+
+No additional IAM permissions are required — Gemini authenticates via the API key fetched from SSM (already covered by the existing `/financial-ai/*` SSM policy). The `bedrock:InvokeModel` permission in the Lambda role is simply unused when `LLM_PROVIDER=gemini`.
+
+### Troubleshooting Gemini
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `RuntimeError: Gemini API key not found` | Key not in SSM | Run Step 2 above |
+| `google.api_core.exceptions.PermissionDenied` | Invalid or revoked key | Regenerate key at aistudio.google.com |
+| `ResourceExhausted: 429` | Free tier rate limit (15 req/min) | Add `time.sleep(5)` between calls, or upgrade to paid |
+| `JSONDecodeError` after Gemini response | Model returned prose instead of JSON | Already handled — `response_mime_type: application/json` enforces JSON mode |
+| `ModuleNotFoundError: google.generativeai` | Old layer without Gemini SDK | Re-run Step 4 to rebuild layer |

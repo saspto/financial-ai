@@ -1,21 +1,29 @@
 """
-AI analyst using AWS Bedrock Claude Haiku 3 (cost-optimized).
-Generates narrative analysis for each section of the report.
-Uses prompt caching for system prompt to reduce cost.
+AI analyst supporting two LLM backends, selected via LLM_PROVIDER env var:
+  - "bedrock"  (default) — AWS Bedrock Claude Haiku 3.5, no external API key
+  - "gemini"             — Google Gemini via API key stored in SSM
 """
 import json
 import logging
 import os
 from datetime import date
+from typing import Optional
 
 import boto3
 
 logger = logging.getLogger(__name__)
 
-# Claude Haiku 3.5 on Bedrock — cost ~$0.80/M input, $4/M output
-# Haiku strikes best cost/quality balance for structured financial summaries
-MODEL_ID = "anthropic.claude-3-5-haiku-20241022-v1:0"
+# ── Provider selection ────────────────────────────────────────────────────────
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "bedrock").lower()  # "bedrock" | "gemini"
+
+# ── Bedrock defaults ──────────────────────────────────────────────────────────
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-5-haiku-20241022-v1:0")
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-west-2")
+
+# ── Gemini defaults ───────────────────────────────────────────────────────────
+# Recommended: gemini-2.0-flash (fast + cheap), gemini-1.5-pro (higher quality)
+GEMINI_MODEL_ID = os.environ.get("GEMINI_MODEL_ID", "gemini-2.0-flash")
+GEMINI_KEY_SSM = os.environ.get("GEMINI_KEY_SSM_PARAM", "/financial-ai/gemini-key")
 
 SYSTEM_PROMPT = """You are a senior financial analyst with 20+ years of experience at top Wall Street firms.
 You write concise, data-driven financial intelligence reports for institutional investors.
@@ -24,9 +32,56 @@ Never speculate beyond data provided. Always note that content is for informatio
 Format responses as JSON exactly as instructed."""
 
 
+def _get_ssm_secret(param_name: str) -> Optional[str]:
+    val = os.environ.get(param_name.split("/")[-1].upper().replace("-", "_"))
+    if val:
+        return val
+    try:
+        ssm = boto3.client("ssm")
+        resp = ssm.get_parameter(Name=param_name, WithDecryption=True)
+        return resp["Parameter"]["Value"]
+    except Exception as e:
+        logger.warning("SSM fetch failed for %s: %s", param_name, e)
+        return None
+
+
+def _extract_json(text: str) -> dict | list:
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0].strip()
+    return json.loads(text)
+
+
 class AIAnalyst:
     def __init__(self):
-        self.bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+        if LLM_PROVIDER == "gemini":
+            self._init_gemini()
+        else:
+            self._init_bedrock()
+
+    def _init_bedrock(self):
+        self._bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+        self._gemini_model = None
+        logger.info("LLM provider: Bedrock (%s)", BEDROCK_MODEL_ID)
+
+    def _init_gemini(self):
+        import google.generativeai as genai
+        api_key = _get_ssm_secret(GEMINI_KEY_SSM)
+        if not api_key:
+            raise RuntimeError(
+                "Gemini API key not found. Store it in SSM at "
+                f"{GEMINI_KEY_SSM} or set GEMINI_KEY env var."
+            )
+        genai.configure(api_key=api_key)
+        self._gemini_model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL_ID,
+            system_instruction=SYSTEM_PROMPT,
+        )
+        self._bedrock = None
+        logger.info("LLM provider: Gemini (%s)", GEMINI_MODEL_ID)
+
+    # ── Public entrypoint ─────────────────────────────────────────────────────
 
     def analyze(
         self,
@@ -40,10 +95,7 @@ class AIAnalyst:
         report_date_end: date,
     ) -> dict:
         date_range = f"{report_date_start.strftime('%B %d')} – {report_date_end.strftime('%B %d, %Y')}"
-
         analysis = {}
-
-        # Run analyses sequentially to control cost
         analysis["market_overview"] = self._market_overview(market_summary, articles, date_range)
         analysis["stock_analysis"] = self._analyze_movers(top_stocks[:15], "stocks", articles)
         analysis["etf_analysis"] = self._analyze_movers(top_etfs[:10], "ETFs", articles)
@@ -53,10 +105,16 @@ class AIAnalyst:
             market_summary, top_stocks[:10], top_etfs[:5],
             articles, upcoming_earnings, buy_sell_data, date_range
         )
-
         return analysis
 
-    def _invoke(self, prompt: str, max_tokens: int = 1500) -> dict:
+    # ── Provider dispatch ─────────────────────────────────────────────────────
+
+    def _invoke(self, prompt: str, max_tokens: int = 1500) -> dict | list:
+        if LLM_PROVIDER == "gemini":
+            return self._invoke_gemini(prompt)
+        return self._invoke_bedrock(prompt, max_tokens)
+
+    def _invoke_bedrock(self, prompt: str, max_tokens: int) -> dict | list:
         try:
             body = {
                 "anthropic_version": "bedrock-2023-05-31",
@@ -64,23 +122,30 @@ class AIAnalyst:
                 "system": SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": prompt}],
             }
-            resp = self.bedrock.invoke_model(
-                modelId=MODEL_ID,
+            resp = self._bedrock.invoke_model(
+                modelId=BEDROCK_MODEL_ID,
                 body=json.dumps(body),
                 contentType="application/json",
                 accept="application/json",
             )
-            result = json.loads(resp["body"].read())
-            text = result["content"][0]["text"]
-            # Extract JSON if wrapped in markdown code block
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-            return json.loads(text)
+            text = json.loads(resp["body"].read())["content"][0]["text"]
+            return _extract_json(text)
         except Exception as e:
             logger.error("Bedrock invoke error: %s", e)
             return {}
+
+    def _invoke_gemini(self, prompt: str) -> dict | list:
+        try:
+            resp = self._gemini_model.generate_content(
+                prompt,
+                generation_config={"response_mime_type": "application/json"},
+            )
+            return _extract_json(resp.text)
+        except Exception as e:
+            logger.error("Gemini invoke error: %s", e)
+            return {}
+
+    # ── Prompt methods (provider-agnostic) ────────────────────────────────────
 
     def _market_overview(self, market_summary: dict, articles: list[dict], date_range: str) -> dict:
         top_articles = [f"- {a['title']} ({a['source']})" for a in articles[:20]]
@@ -100,8 +165,7 @@ Return ONLY valid JSON:
   "market_mood": "Bullish|Bearish|Mixed|Cautious",
   "major_drivers": ["driver1", "driver2", "driver3"]
 }}"""
-        result = self._invoke(prompt, 800)
-        return result or {
+        return self._invoke(prompt, 800) or {
             "headline": f"Markets active {date_range}",
             "overview": "Market data collected and analyzed.",
             "key_themes": [],
@@ -114,7 +178,7 @@ Return ONLY valid JSON:
         relevant_articles = [
             f"- {a['title']}: {a['summary'][:100]}"
             for a in articles
-            if any(s.lower() in (a.get("title","") + a.get("summary","")).lower() for s in symbols)
+            if any(s.lower() in (a.get("title", "") + a.get("summary", "")).lower() for s in symbols)
         ][:15]
 
         movers_text = json.dumps([{
@@ -156,7 +220,6 @@ Return ONLY valid JSON array with one object per {asset_class[:-1]}:
             f"{s['symbol']}: {', '.join(s.get('signals', []))}"
             for s in buy_sell_data.get("sell", [])[:10]
         ]
-
         prompt = f"""Provide buy and sell point commentary for traders.
 
 Stocks/ETFs Reaching Buy Points (technical signals):
@@ -172,8 +235,7 @@ Return ONLY valid JSON:
   "strategy_note": "One actionable strategic note for today",
   "disclaimer": "Technical signals are not guarantees; always do your own research."
 }}"""
-        result = self._invoke(prompt, 600)
-        return result or {
+        return self._invoke(prompt, 600) or {
             "buy_commentary": "Technical buy signals identified based on RSI, moving averages, and price action.",
             "sell_commentary": "Overbought conditions and technical resistance noted for select names.",
             "strategy_note": "Monitor key levels and volume for confirmation.",
@@ -189,15 +251,13 @@ Return ONLY valid JSON:
         rel_articles = [
             f"- {a['title']}"
             for a in articles
-            if any(s in (a.get("title","") + a.get("summary","")) for s in symbols)
+            if any(s in (a.get("title", "") + a.get("summary", "")) for s in symbols)
         ][:10]
-
-        earnings_text = json.dumps(top_earnings, indent=2)
 
         prompt = f"""Preview upcoming earnings for this week and next week.
 
 Upcoming Earnings:
-{earnings_text}
+{json.dumps(top_earnings, indent=2)}
 
 Related News:
 {chr(10).join(rel_articles) if rel_articles else "None found."}
@@ -215,8 +275,7 @@ Return ONLY valid JSON:
     }}
   ]
 }}"""
-        result = self._invoke(prompt, 1000)
-        return result or {"commentary": "Earnings season continues.", "highlights": []}
+        return self._invoke(prompt, 1000) or {"commentary": "Earnings season continues.", "highlights": []}
 
     def _ten_things(
         self,
@@ -237,7 +296,7 @@ Return ONLY valid JSON:
 
         prompt = f"""Generate "10 Things to Know Today" for financial professionals. Date range: {date_range}.
 
-Market Summary: {json.dumps({k: v.get('change_pct') for k,v in market_summary.items()}, indent=2)}
+Market Summary: {json.dumps({k: v.get('change_pct') for k, v in market_summary.items()}, indent=2)}
 Top Stocks: {top_stock_names}
 Top ETFs: {top_etf_names}
 Buy Points: {buy_syms or "None"}
@@ -257,6 +316,6 @@ Return ONLY a valid JSON array of exactly 10 items:
 ]"""
         result = self._invoke(prompt, 2000)
         return result if isinstance(result, list) else [
-            {"number": i+1, "headline": f"Point {i+1}", "detail": "See full report.", "category": "Markets"}
+            {"number": i + 1, "headline": f"Point {i + 1}", "detail": "See full report.", "category": "Markets"}
             for i in range(10)
         ]

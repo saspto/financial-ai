@@ -24,6 +24,15 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
+  LLMProvider:
+    Type: String
+    Default: bedrock
+    AllowedValues: [bedrock, gemini]
+    Description: LLM backend — "bedrock" uses Claude Haiku (no extra key), "gemini" uses Google Gemini API key from SSM
+  GeminiModelId:
+    Type: String
+    Default: gemini-2.0-flash
+    Description: Gemini model ID (only used when LLMProvider=gemini)
 
 Conditions:
   UseKMS: !Equals [!Ref EnableKMSEncryption, "true"]
@@ -168,6 +177,10 @@ Resources:
           SES_RECIPIENTS: !Ref SESEmailRecipients
           BEDROCK_REGION: !Ref BedrockRegion
           REPORT_PREFIX: reports
+          # LLM provider switch: "bedrock" (default) or "gemini"
+          LLM_PROVIDER: !Ref LLMProvider
+          GEMINI_MODEL_ID: !Ref GeminiModelId
+          GEMINI_KEY_SSM_PARAM: /financial-ai/gemini-key
       Code:
         S3Bucket: !Sub "financial-ai-deploy-${AWS::AccountId}"
         S3Key: lambda.zip
