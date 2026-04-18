@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "bedrock").lower()  # "bedrock" | "gemini"
 
 # ── Bedrock defaults ──────────────────────────────────────────────────────────
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-5-haiku-20241022-v1:0")
+# Amazon Nova Lite — no Marketplace subscription required, ~$0.06/1M input tokens
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.amazon.nova-lite-v1:0")
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-west-2")
 
 # ── Gemini defaults ───────────────────────────────────────────────────────────
@@ -116,19 +117,14 @@ class AIAnalyst:
 
     def _invoke_bedrock(self, prompt: str, max_tokens: int) -> dict | list:
         try:
-            body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": max_tokens,
-                "system": SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": prompt}],
-            }
-            resp = self._bedrock.invoke_model(
+            # Use Bedrock Converse API — works with both Anthropic and Amazon models
+            resp = self._bedrock.converse(
                 modelId=BEDROCK_MODEL_ID,
-                body=json.dumps(body),
-                contentType="application/json",
-                accept="application/json",
+                system=[{"text": SYSTEM_PROMPT}],
+                messages=[{"role": "user", "content": [{"text": prompt}]}],
+                inferenceConfig={"maxTokens": max_tokens, "temperature": 0.1},
             )
-            text = json.loads(resp["body"].read())["content"][0]["text"]
+            text = resp["output"]["message"]["content"][0]["text"]
             return _extract_json(text)
         except Exception as e:
             logger.error("Bedrock invoke error: %s", e)

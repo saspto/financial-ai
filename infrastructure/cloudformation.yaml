@@ -130,8 +130,8 @@ Resources:
                 Effect: Allow
                 Action:
                   - bedrock:InvokeModel
-                Resource:
-                  - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0"
+                  - bedrock:Converse
+                Resource: "*"
               - Sid: SESEmail
                 Effect: Allow
                 Action:
